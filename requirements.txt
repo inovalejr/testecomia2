@@ -1,0 +1,9 @@
+numpy
+pandas
+duckdb
+scikit-learn
+sentence-transformers
+gradio
+langgraph
+pydantic
+openai
