@@ -6,4 +6,4 @@ sentence-transformers
 gradio
 langgraph
 pydantic
-openai
+openai==0.28.1
