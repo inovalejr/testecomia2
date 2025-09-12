@@ -340,6 +340,40 @@ def main():
     llm = LLMProvider()
     graph = build_graph(retriever, llm)
 
+# ---------------------------
+# Gradio UI
+# ---------------------------
+def main():
+    # Paths esperados (coloque seus CSVs em data/)
+    expected = {
+        "Sites": os.path.join(DATA_DIR, "sites.csv"),
+        "Stoppers": os.path.join(DATA_DIR, "stoppers.csv"),
+        "Projeto": os.path.join(DATA_DIR, "projetos.csv"),
+        "Tarefas": os.path.join(DATA_DIR, "tarefas.csv"),
+    }
+    # Validar arquivos
+    missing = [p for p in expected.values() if not os.path.exists(p)]
+    if missing:
+        logger.warning("Arquivos faltando em data/: " + ", ".join(missing))
+        # Não falha aqui para facilitar testes locais; mas avisa o usuário
+    # Carrega só os CSVs existentes
+    present = {k: v for k, v in expected.items() if os.path.exists(v)}
+    if not present:
+        # Para permitir testes locais sem dados, cria bases vazias com colunas mínimas
+        logger.info("Nenhuma base encontrada em data/ — criando bases vazias para UI.")
+        bases = {
+            "Sites": pd.DataFrame(columns=["codigo", "nome", "estado", "observacao"]),
+            "Stoppers": pd.DataFrame(columns=["cod_stopper", "descricao", "criticidade", "risco", "observacao"]),
+            "Projeto": pd.DataFrame(columns=["codigo", "fase", "descricao", "observacao"]),
+            "Tarefas": pd.DataFrame(columns=["codigo", "atividade", "status", "observacao", "executor"]),
+        }
+    else:
+        bases = load_bases({k: expected[k] for k in expected if os.path.exists(expected[k])})
+
+    retriever = HybridRetriever(bases)
+    llm = LLMProvider()
+    graph = build_graph(retriever, llm)
+
     # Gradio components
     base_choices = list(bases.keys())
     dropdown = gr.Dropdown(base_choices, label="Base", value=base_choices[0] if base_choices else None)
@@ -356,8 +390,8 @@ def main():
         state = AgentState(query=query or "", base=base or "", where_sql=(where_sql or None), k=int(k))
         out_state = graph.invoke(state)
         # prepare retrieved table
-        if out_state.retrieved:
-            df = pd.DataFrame(out_state.retrieved)
+        if out_state.get('retrieved'):
+            df = pd.DataFrame(out_state.get('retrieved'))
             # ensure snippet and score are present
             if "_snippet" not in df.columns:
                 df["_snippet"] = df.apply(lambda r: " / ".join([str(r[c]) for c in r.index if c not in ["_score"] and str(r[c]).strip() != ""]), axis=1)
@@ -369,7 +403,7 @@ def main():
             display_df = pd.DataFrame([{"_snippet": "Nenhum trecho encontrado", "_score": ""}])
         elapsed = time.time() - t0
         logger.info(f"Pergunta='{query}' Base={base} k={k} -> tempo {elapsed:.2f}s")
-        return out_state.result or "Sem resposta", display_df
+        return out_state.get('result') or "Sem resposta", display_df
 
     with gr.Blocks(title="Agente RAG - Brisanet (Sites/Stoppers/Projeto/Tarefas)") as demo:
         gr.Markdown("# Agente RAG — Rápido e robusto")
