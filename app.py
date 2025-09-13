@@ -1,425 +1,473 @@
 """
-app.py — RAG + LangGraph + Gradio para bases CSV (Sites, Stoppers, Projeto, Tarefas)
-Feito para Railway: usa PORT do env e server_name="0.0.0.0".
-Recursos:
- - Cache de embeddings (.npz) por base para inicialização rápida
- - Hybrid retriever: DuckDB (filtros SQL) + busca semântica (SentenceTransformer)
- - LLM via OpenAI ChatCompletion (fallback para mock se OPENAI_API_KEY ausente)
- - LangGraph para orquestração simples
- - Gradio com histórico, exibição de trechos recuperados e scores
- - Logging básico
+app.py — Agente RAG + DuckDB + LangGraph + Gradio focado na base 'Stoppers'
+- Foco: respostas conversacionais (sem scores), e análises avançadas **apenas quando solicitadas**.
+- Deploy-ready: demo.launch(server_name="0.0.0.0", server_port=PORT)
 """
 
 from __future__ import annotations
 import os
 import sys
 import time
-import json
 import logging
+import re
 from typing import Dict, List, Any, Optional, Tuple
-import numpy as np
 import pandas as pd
+import numpy as np
 import duckdb
 from pydantic import BaseModel
+import gradio as gr
+
+# Embeddings / RAG
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-import gradio as gr
+
+# LangGraph
 from langgraph.graph import StateGraph, END
 
-# Optional OpenAI import; only used if OPENAI_API_KEY provided
+# Optional OpenAI for LLM responses (if provided)
 try:
     import openai
 except Exception:
     openai = None
 
-# ---------------------------
+# -----------------------
 # Config
-# ---------------------------
-DATA_DIR = os.getenv("DATA_DIR", "data")  # coloque seus CSVs aqui
+# -----------------------
+DATA_DIR = os.getenv("DATA_DIR", "data")
+STOPPERS_CSV = os.path.join(DATA_DIR, "stoppers.csv")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # ajuste se necessário
 EMBED_CACHE_DIR = os.getenv("EMBED_CACHE_DIR", "embed_cache")
-TOP_K = int(os.getenv("TOP_K", "6"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", 8080))
+TOP_K = int(os.getenv("TOP_K", 6))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Cria diretórios
 os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Logging
-logging.basicConfig(
-    stream=sys.stdout,
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("rag_app")
+logging.basicConfig(stream=sys.stdout, level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("stoppers_agent")
 
-# ---------------------------
-# Utils: carregar CSVs
-# ---------------------------
-def load_bases(paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-    bases = {}
-    for name, path in paths.items():
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"CSV não encontrado: {path} (espere colocar {name})")
-        df = pd.read_csv(path, dtype=str).fillna("")
-        # Normalize column names
-        df.columns = [c.strip().replace(" ", "_").replace("-", "_") for c in df.columns]
-        # Trim strings
-        for col in df.select_dtypes(include=["object"]).columns:
-            df[col] = df[col].astype(str).str.strip()
-        bases[name] = df.reset_index(drop=True)
-        logger.info(f"Carregada base {name} com {len(df)} linhas.")
-    return bases
+# -----------------------
+# System Prompt (Master)
+# -----------------------
+SYSTEM_PROMPT = """
+Você é um assistente especialista em Stoppers da Brisanet. Seu papel:
+- Analisar registros de stoppers e responder de forma natural, consultiva e prática.
+- Entender todas as colunas da base (códigos, nome do site, código stopper, tipo, status, descrição,
+  criticidade, datas, solicitante, papel responsável, fornecedor, responsável, etc).
+- Não mostre scores, IDs técnicos ou debug. Responda como um analista sênior.
+- Realize validações técnicas (datas, coerência status/descriptions) e análises gerenciais apenas
+  quando requisitado explicitamente (ex.: "qual % resolvido dentro do prazo no mês passado?").
+- Sempre que apropriado, proponha ações concretas (quem acionar, próxima atividade).
+"""
 
-# ---------------------------
-# Semantic index with cache
-# ---------------------------
+# -----------------------
+# Utilities: load & normalize
+# -----------------------
+def load_stoppers(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        logger.warning(f"Arquivo não encontrado: {path}. Criando DataFrame vazio padrão.")
+        cols = ["Códigos de sitio","Nombres de sitios","Nombre","Código","Código de workflow",
+                "Código Stopper","Nome Stopper","Tipo de Stopper","Status","Descrição","Criticidade",
+                "Data de solicitacao","Data vencimiento","Data de encerramento","hora de encerramento",
+                "Atributo","solicitado por","Papel responsable","Fornecedor responsavel","Responsavel"]
+        return pd.DataFrame(columns=cols)
+    df = pd.read_csv(path, dtype=str).fillna("")
+    # Normalize column names (strip)
+    df.columns = [c.strip() for c in df.columns]
+    # Standardize known Portuguese column names variants
+    # (no rename forced, we'll access by names as-is, but ensure common ones exist)
+    return df
+
+# -----------------------
+# Semantic Index (SentenceTransformer) with cache
+# -----------------------
 class SemanticIndex:
-    def __init__(self, name: str, df: pd.DataFrame, text_cols: List[str], model_name: str = EMBEDDING_MODEL):
-        self.name = name
+    def __init__(self, df: pd.DataFrame, text_cols: List[str], model_name: str = EMBEDDING_MODEL):
         self.df = df.reset_index(drop=True)
-        self.text_cols = text_cols or df.columns.tolist()
+        self.text_cols = text_cols
         self.model_name = model_name
         self.model = SentenceTransformer(self.model_name)
+        # Build corpus: join text columns into a single string per row
         self.corpus = (self.df[self.text_cols].fillna("").astype(str).agg(" \n ".join, axis=1)).tolist()
-        self.emb = self._load_or_build_embeddings()
-        logger.info(f"Index {self.name}: corpus {len(self.corpus)} embeddings shape {self.emb.shape}")
+        self.emb = self._load_or_build()
 
     def cache_path(self) -> str:
-        safe = "".join([c for c in self.name if c.isalnum() or c in "_-"]).lower()
-        return os.path.join(EMBED_CACHE_DIR, f"{safe}_emb.npz")
+        return os.path.join(EMBED_CACHE_DIR, "stoppers_emb.npz")
 
-    def _load_or_build_embeddings(self) -> np.ndarray:
+    def _load_or_build(self):
         path = self.cache_path()
         if os.path.exists(path):
             try:
                 npz = np.load(path)
                 emb = npz["emb"]
                 if emb.shape[0] == len(self.corpus):
-                    logger.info(f"Carregando embeddings em cache para {self.name} ({path})")
+                    logger.info("Carregando embeddings de cache (stoppers).")
                     return emb
                 else:
-                    logger.info("Cache mismatch de tamanho, recalculando embeddings.")
+                    logger.info("Cache mismatch (tamanho). Recriando embeddings.")
             except Exception as e:
-                logger.warning(f"Erro ao carregar cache {path}: {e}. Recalculando.")
-        # Build
-        logger.info(f"Calculando embeddings para {self.name} usando {self.model_name} ...")
+                logger.warning(f"Erro ao carregar cache: {e}")
+        logger.info("Calculando embeddings (pode demorar na primeira execução)...")
         emb = self.model.encode(self.corpus, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True)
         np.savez_compressed(path, emb=emb)
         logger.info(f"Embeddings salvos em cache: {path}")
         return emb
 
-    def search(self, query: str, k: int = TOP_K) -> List[Tuple[int, float]]:
-        if not isinstance(query, str) or query.strip() == "":
+    def search(self, query: str, k:int = TOP_K) -> List[Tuple[int, float]]:
+        if not query or str(query).strip()=="":
             return []
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
         sims = cosine_similarity(q_emb, self.emb)[0]
         topk = sims.argsort()[::-1][:k]
         return [(int(i), float(sims[i])) for i in topk]
 
-# ---------------------------
-# HybridRetriever
-# ---------------------------
-class HybridRetriever:
-    def __init__(self, bases: Dict[str, pd.DataFrame]):
-        self.bases = bases
-        # heurística de colunas textuais por base (ajuste para o seu CSV)
-        self.text_cols_map = {
-            "Sites": [c for c in bases.get("Sites", pd.DataFrame()).columns if c.lower() in {"codigo","estado","tipodesite","observacao","descricao","nome","nome_site"}],
-            "Stoppers": [c for c in bases.get("Stoppers", pd.DataFrame()).columns if c.lower() in {"cod_stopper","codigo_stopper","descricao","criticidade","risco","base","status","observacao"}],
-            "Projeto": [c for c in bases.get("Projeto", pd.DataFrame()).columns if c.lower() in {"codigo","fase","observacao","descricao","escopo","nome_projeto"}],
-            "Tarefas": [c for c in bases.get("Tarefas", pd.DataFrame()).columns if c.lower() in {"codigo","atividade","status","observacao","descricao","executor","responsavel"}],
-        }
-        # fallback: se a lista ficar vazia, use todas as colunas
-        self.indexes = {}
-        for name, df in bases.items():
-            text_cols = self.text_cols_map.get(name) or df.columns.tolist()
-            logger.info(f"Construindo SemanticIndex para base '{name}' com colunas: {text_cols}")
-            self.indexes[name] = SemanticIndex(name, df, text_cols)
+# -----------------------
+# Advanced duckdb queries (only run when asked)
+# -----------------------
+def detect_advanced_request(text: str) -> bool:
+    # triggers for advanced analytics: percent, resolved within, taxa, percentual, "mês", last month, "resolvidos dentro"
+    patterns = [r"\bpercent", r"\bpercentual", r"\bporcent", r"\bresolvid", r"dentro do prazo", r"taxa", r"mês", r"último", r"última", r"last month", r"\b%"]
+    t = text.lower()
+    return any(re.search(p, t) for p in patterns)
 
-    def sql_filter(self, base: str, where_sql: str, limit: int = 200) -> pd.DataFrame:
-        if base not in self.bases:
-            raise KeyError(f"Base desconhecida: {base}")
-        df = self.bases[base]
-        duckdb.register("tmp", df)
-        try:
-            q = f"SELECT * FROM tmp WHERE {where_sql} LIMIT {limit}"
-            out = duckdb.sql(q).df()
-            logger.info(f"SQL filter on {base}: '{where_sql}' -> {len(out)} rows")
-            return out
-        finally:
-            try:
-                duckdb.unregister("tmp")
-            except Exception:
-                pass
-
-    def semantic_search(self, base: str, query: str, k: int = TOP_K) -> pd.DataFrame:
-        if base not in self.indexes:
-            raise KeyError(f"Base desconhecida: {base}")
-        idx = self.indexes[base]
-        hits = idx.search(query, k=k)
-        rows = []
-        for i, score in hits:
-            row = idx.df.iloc[i].copy()
-            row["_score"] = score
-            row["_snippet"] = " / ".join([str(row[col]) for col in idx.text_cols if col in row.index and str(row[col]).strip() != ""])
-            rows.append(row)
-        df_hits = pd.DataFrame(rows)
-        logger.info(f"Semantic search on {base}: query='{query}' -> {len(df_hits)} hits")
-        return df_hits
-
-    def combined_search(self, base: str, query: str, where_sql: Optional[str] = None, k: int = TOP_K) -> pd.DataFrame:
-        """
-        Primeiro filtra com SQL (se provided) e depois roda busca semântica somente sobre o subset.
-        Se where_sql for None, roda a busca semântica na base inteira.
-        """
-        if where_sql:
-            filtered = self.sql_filter(base, where_sql, limit=1000)  # subset razoável
-            if filtered.empty:
-                return filtered
-            # montar índice temporário para o subset (não cacheado)
-            temp_idx = SemanticIndex(f"{base}_temp", filtered, filtered.columns.tolist(), model_name=EMBEDDING_MODEL)
-            hits = temp_idx.search(query, k=k)
-            rows = []
-            for i, score in hits:
-                row = temp_idx.df.iloc[i].copy()
-                row["_score"] = score
-                row["_snippet"] = " / ".join([str(row[c]) for c in temp_idx.text_cols if str(row[c]).strip() != ""])
-                rows.append(row)
-            return pd.DataFrame(rows)
+def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str, period: Optional[dict] = None) -> str:
+    """
+    Exemplo de análise: % de stoppers resolvidos dentro do prazo.
+    period: optional dict like {"year":2024,"month":8} to limit by month of solicitation or vencimento.
+    """
+    where = ""
+    if period and period.get("year"):
+        # assume Data de solicitacao in YYYY-MM-DD or similar
+        y = int(period["year"])
+        m = int(period.get("month", 0))
+        if m:
+            where = f"WHERE strftime('%Y', Data_de_solicitacao)='{y}' AND strftime('%m', Data_de_solicitacao)='{m:02d}'"
         else:
-            return self.semantic_search(base, query, k=k)
+            where = f"WHERE strftime('%Y', Data_de_solicitacao)='{y}'"
 
-# ---------------------------
-# LLM Provider
-# ---------------------------
+    # We need to ensure column names are safe; map user columns to normalized ones in df_name
+    query = f"""
+    SELECT
+       SUM(CASE WHEN Data_de_encerramento!='' AND Data_de_vencimiento!='' AND date(Data_de_encerramento) <= date(Data_de_vencimiento) THEN 1 ELSE 0 END) as dentro,
+       SUM(CASE WHEN Data_de_encerramento!='' THEN 1 ELSE 0 END) as encerrados,
+       COUNT(*) as total
+    FROM {df_name}
+    {where}
+    """
+    # Try multiple possible column name spellings - we'll adapt query to actual column names in the temp table
+    # But for simplicity below, assume we created a temp view with aliased columns: Data_de_solicitacao, Data_de_vencimiento, Data_de_encerramento
+    try:
+        res = con.execute(query).fetchdf()
+        if res.empty:
+            return "Não foi possível calcular - sem registros."
+        d = int(res.at[0,'dentro'] or 0)
+        e = int(res.at[0,'encerrados'] or 0)
+        tot = int(res.at[0,'total'] or 0)
+        if tot == 0:
+            return "Não há registros no período solicitado."
+        pct = (d / tot) * 100
+        return f"{pct:.1f}% dos {tot} stoppers foram resolvidos dentro do prazo (encerrados: {e}, dentro do prazo: {d})."
+    except Exception as ex:
+        logger.error(f"Erro em duckdb_percent_resolved_within: {ex}")
+        return "Não foi possível calcular o percentual devido a formato de datas ou colunas."
+
+def duckdb_group_count_percent(con: duckdb.DuckDBPyConnection, group_col: str, df_name: str, top_n: int = 6) -> str:
+    """
+    Agrupa por uma coluna e retorna top N com percentuais
+    """
+    safe_col = group_col.replace('"', '')
+    try:
+        q = f"""
+        SELECT {safe_col} as grupo, COUNT(*) as cnt
+        FROM {df_name}
+        GROUP BY {safe_col}
+        ORDER BY cnt DESC
+        LIMIT {top_n}
+        """
+        df = con.execute(q).fetchdf()
+        total = con.execute(f"SELECT COUNT(*) as total FROM {df_name}").fetchdf().at[0,'total'] or 0
+        if total == 0:
+            return "Sem registros para agrupar."
+        lines = []
+        for _, row in df.iterrows():
+            grupo = row['grupo'] if row['grupo'] is not None else "SEM VALOR"
+            cnt = int(row['cnt'])
+            pct = (cnt/total)*100
+            lines.append(f"- {grupo}: {cnt} ({pct:.1f}%)")
+        return "Top ocorrências:\n" + "\n".join(lines)
+    except Exception as ex:
+        logger.error(f"Erro em duckdb_group_count_percent: {ex}")
+        return "Erro ao agrupar por coluna solicitada. Verifique o nome da coluna."
+
+# -----------------------
+# LLMProvider: OpenAI or Mock
+# -----------------------
 class LLMProvider:
-    def __init__(self, model_name: str = OPENAI_MODEL, openai_key: str = OPENAI_API_KEY):
-        self.model_name = model_name
+    def __init__(self, openai_key: str = OPENAI_API_KEY, model_name: str = OPENAI_MODEL):
+        self.model = model_name
         self.use_openai = False
         if openai_key and openai is not None:
             openai.api_key = openai_key
             self.use_openai = True
-            logger.info("LLMProvider: usando OpenAI ChatCompletion")
+            logger.info("LLMProvider: usando OpenAI")
         else:
             if openai_key and openai is None:
-                logger.warning("OPENAI_API_KEY presente mas pacote 'openai' não instalado. Usando fallback mock.")
+                logger.warning("OPENAI_API_KEY set but 'openai' package not available; using mock.")
             else:
-                logger.info("OPENAI_API_KEY não setada. Usando LLM mock (local) para testes.")
+                logger.info("OPENAI_API_KEY não setado; usando mock responder.")
             self.use_openai = False
 
-    def chat(self, query: str, context: str) -> str:
-        """
-        Faz prompt para o modelo. Se OpenAI não estiver disponível, retorna uma resposta estruturada mock.
-        A resposta inclui: 1) trechos usados (context preview), 2) resposta final (resumo).
-        """
-        system = (
-            "Você é um assistente técnico especializado em implantação de redes (ex.: Sites, Stoppers, Tarefas, Projeto). "
-            "Responda com objetividade, cite quais trechos dos dados usou e indique possíveis incertezas."
-        )
-        prompt = f"""
-Contexto recuperado (trechos relevantes):
-{context}
-
-Pergunta:
-{query}
-
-Instruções:
-1) Primeiro liste os 3 principais achados do contexto (breve).
-2) Em seguida, proponha a resposta direta à pergunta (até 200 palavras).
-3) Se houver incerteza ou falta de dados, diga explicitamente o que falta.
-4) Se aplicável, indique qual base (Sites, Stoppers, Projeto, Tarefas) parece conter as informações.
-"""
+    def answer(self, prompt: str, max_tokens:int=400) -> str:
         if self.use_openai:
             try:
                 resp = openai.ChatCompletion.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=800,
-                    temperature=0
+                    model=self.model,
+                    messages=[{"role":"system","content":SYSTEM_PROMPT}, {"role":"user","content":prompt}],
+                    temperature=0,
+                    max_tokens=max_tokens
                 )
-                text = resp["choices"][0]["message"]["content"].strip()
-                return text
+                return resp['choices'][0]['message']['content'].strip()
             except Exception as e:
-                logger.error(f"Erro ao chamar OpenAI: {e}")
-                # fallback to mock formatting
-        # Mock fallback
-        snippet_preview = "\n".join(context.splitlines()[:6])
-        return (
-            f"--- MOCK RESPONDER (OpenAI não configurado) ---\n\n"
-            f"Trechos usados (preview):\n{snippet_preview}\n\n"
-            f"Resposta (mock):\nBaseado nos trechos acima, resposta direta para: {query}\n\n"
-            f"(Configure OPENAI_API_KEY para usar o modelo real.)"
-        )
+                logger.error(f"OpenAI error: {e}")
+                # fallback to mock
+        # Mock: concise, safe reply (use prompt excerpt)
+        excerpt = prompt.strip()[:800]
+        return ("[MOCK RESPONSE - OPENAI não configurado]\n"
+                "Resumo do pedido: " + (excerpt[:400] + ("..." if len(excerpt)>400 else "")) + 
+                "\n\nResposta simulada: verifique a configuração de OPENAI_API_KEY para usar LLM real.")
 
-# ---------------------------
-# LangGraph pipeline
-# ---------------------------
+# -----------------------
+# LangGraph pipeline nodes
+# -----------------------
 class AgentState(BaseModel):
-    query: str
-    base: str
-    where_sql: Optional[str] = None
-    k: int = TOP_K
+    pergunta: str
     result: Optional[str] = None
-    retrieved: Optional[List[Dict[str, Any]]] = None
+    retrieved: Optional[List[Dict[str,Any]]] = None
+    action_suggested: Optional[str] = None
 
-def build_graph(retriever: HybridRetriever, llm: LLMProvider):
+def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_table_name: str, llm: LLMProvider):
     graph = StateGraph(AgentState)
 
-    def retrieve(state: AgentState) -> AgentState:
-        # Decide whether usar combined_search (SQL + sem)
-        if state.where_sql and state.where_sql.strip() != "":
-            df = retriever.combined_search(state.base, state.query, where_sql=state.where_sql, k=state.k)
-        else:
-            df = retriever.semantic_search(state.base, state.query, k=state.k)
-        if df is None or df.empty:
-            state.retrieved = []
-            context = ""
-        else:
-            # Monta contexto com top N trechos e scores
-            rows = df.to_dict(orient="records")
-            state.retrieved = rows
-            # Build plain text context: include snippet and score and selected columns
-            parts = []
-            for r in rows:
-                score = r.get("_score", "")
-                snippet = r.get("_snippet", "")
-                # keep some key columns to help the LLM
-                key_info = []
-                for kcol in ["codigo", "cod_stopper", "atividade", "nome", "estado", "fase", "executor"]:
-                    if kcol in r and str(r[kcol]).strip() != "":
-                        key_info.append(f"{kcol}: {r[kcol]}")
-                parts.append(f"SCORE={score:.4f} | {'; '.join(key_info)}\nSNIPPET: {snippet}")
-            context = "\n\n".join(parts)
-        ans = llm.chat(state.query, context)
-        state.result = ans
-        return state
+    def triagem(state: AgentState) -> AgentState:
+        q = (state.pergunta or "").lower()
+        # Simple keyword triage to decide path
+        if any(k in q for k in ["abrir chamado","abram chamado","abrir ticket","abrir chamado"]):
+            # direct open ticket
+            return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "ABRIR_CHAMADO"}
+        # If user asks for statistics/percentual -> advanced analytics
+        if detect_advanced_request(q):
+            return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "ANALISE_AVANCADA"}
+        # If user asks simple verification or asks about a specific stopper -> try auto-resolver (retrieve context + answer)
+        return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "AUTO_RESOLVER"}
 
-    graph.add_node("retrieve", retrieve)
-    graph.set_entry_point("retrieve")
-    graph.add_edge("retrieve", END)
+    def auto_resolver(state: AgentState) -> AgentState:
+        q = state.pergunta or ""
+        # semantic retrieve top K
+        hits = retriever.search(q, k=TOP_K)
+        rows = []
+        for idx, score in hits:
+            row = retriever.df.iloc[idx].to_dict()
+            # build snippet that is human readable (no scores shown to user)
+            snippet = " | ".join([f"{c}: {row.get(c,'')}" for c in retriever.text_cols if str(row.get(c,'')).strip()!=''])
+            rows.append({"snippet": snippet})
+        # build prompt for LLM: include system prompt implicitly via LLMProvider, but give context
+        context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
+        prompt = f"Contexto (trechos relevantes):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
+        answer = llm.answer(prompt)
+        return {"pergunta": state.pergunta, "result": answer, "retrieved": rows, "action_suggested": None}
+
+    def analise_avancada(state: AgentState) -> AgentState:
+        # Interpret some advanced queries and run DuckDB aggregations
+        q = (state.pergunta or "").lower()
+        # create a working temporary view with normalized column names for SQL convenience
+        # map expected columns to normalized ones (create a temp table 'stoppers_work')
+        try:
+            # Try to produce normalized columns for SQL queries
+            # We'll alias user columns to safe names
+            df_cols = con.execute(f"DESCRIBE {df_table_name}").fetchdf()
+        except Exception:
+            pass  # ignore if can't describe
+        # Common advanced intents:
+        if "resolvid" in q and "prazo" in q or "dentro do prazo" in q or "%" in q or "percent" in q or "percentual" in q:
+            # run percent resolved within due date in last month if month mentioned, else overall
+            # simple period detection: look for 'mês passado' or 'último mês' or 'ultimo mes' or 'ano'
+            # We'll attempt last month
+            period = None
+            if "mês passado" in q or "mes passado" in q or "último mês" in q or "ultimo mes" in q:
+                # compute last month from now
+                today = pd.Timestamp.now()
+                last = today - pd.DateOffset(months=1)
+                period = {"year": last.year, "month": last.month}
+            # For duckdb computation, ensure we have aliased columns in a temporary table
+            # Let's create a temp view with predictable names from the original df_table_name
+            # Mapping best-effort:
+            # Try common names variants to rename in the view
+            rename_sql = f"""
+            CREATE OR REPLACE VIEW stoppers_work AS
+            SELECT
+               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de solicitacao','Data_de_solicitacao','Data de solicitacao'])}" AS Data_de_solicitacao,
+               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de vencimiento','Data_de_vencimiento','Data de vencimiento'])}" AS Data_de_vencimiento,
+               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de encerramento','Data_de_encerramento','Data de encerramento'])}" AS Data_de_encerramento,
+               *
+            FROM {df_table_name}
+            """
+            # If we can't robustly rename, ignore and just try working with original columns (duckdb is tolerant)
+            # Call percent function
+            res_text = duckdb_percent_resolved_within(con, "stoppers_work" if view_exists(con, "stoppers_work") else df_table_name, period)
+            # Use LLM to polish textual output if needed
+            prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nFormule uma resposta humana e consultiva com recomendações práticas."
+            answer = llm.answer(prompt)
+            return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+        # Other grouping requests: "por criticidade", "por tipo", "por responsavel"
+        match = re.search(r"por (\w+)", q)
+        if match:
+            col = match.group(1)
+            # try mapping small Portuguese column words to actual column names heuristically
+            mapping = {
+                "criticidade": ["Criticidade","criticidade"],
+                "tipo": ["Tipo de Stopper","Tipo","Tipo_de_Stopper"],
+                "responsavel": ["Responsavel","responsavel","Papel responsable","Fornecedor responsavel"],
+                "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
+            }
+            cand_cols = mapping.get(col, [col])
+            chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
+            res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
+            prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
+            answer = llm.answer(prompt)
+            return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+
+        # Fallback generic: run top N stoppers frequency
+        res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
+        prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
+        answer = llm.answer(prompt)
+        return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+
+    def pedir_info(state: AgentState) -> AgentState:
+        # Ask the user to clarify
+        return {"pergunta": state.pergunta, "result": "Preciso de mais detalhes para responder; por favor especifique o período, cidade ou coluna desejada.", "retrieved": None, "action_suggested": None}
+
+    def abrir_chamado(state: AgentState) -> AgentState:
+        # Provide template for opening ticket
+        q = state.pergunta or ""
+        template = (f"Solicitação de abertura de chamado gerada automaticamente.\nResumo: {q[:250]}\n"
+                    "Prioridade sugerida: Alta. Próximo passo: notificar responsável do workflow.")
+        return {"pergunta": state.pergunta, "result": template, "retrieved": None, "action_suggested": "ABRIR_CHAMADO"}
+
+    # Register nodes
+    graph.add_node("triagem", triagem)
+    graph.add_node("auto_resolver", auto_resolver)
+    graph.add_node("analise_avancada", analise_avancada)
+    graph.add_node("pedir_info", pedir_info)
+    graph.add_node("abrir_chamado", abrir_chamado)
+
+    # flow: start -> triagem -> branch
+    graph.set_entry_point("triagem")
+    graph.add_edge("triagem", "auto_resolver")
+    graph.add_edge("triagem", "analise_avancada")
+    graph.add_edge("triagem", "abrir_chamado")
+    graph.add_edge("triagem", "pedir_info")
+    # each node returns END
+    graph.add_edge("auto_resolver", END)
+    graph.add_edge("analise_avancada", END)
+    graph.add_edge("pedir_info", END)
+    graph.add_edge("abrir_chamado", END)
+
     return graph.compile()
 
-# ---------------------------
-# Gradio UI
-# ---------------------------
+# -----------------------
+# Helper functions for duckdb column mapping (used in advanced node)
+# -----------------------
+def retrieve_original_cols(con: duckdb.DuckDBPyConnection, table_name: str) -> List[str]:
+    try:
+        df = con.execute(f"PRAGMA table_info('{table_name}')").fetchdf()
+        return [r['name'] for _, r in df.iterrows()]
+    except Exception:
+        return []
+
+def column_exists(con: duckdb.DuckDBPyConnection, table_name: str, col_name: str) -> bool:
+    cols = retrieve_original_cols(con, table_name)
+    return col_name in cols
+
+def get_col_safe(cols: List[str], candidates: List[str], default: Optional[str] = None) -> str:
+    for c in candidates:
+        if c in cols:
+            return c
+    return default or (candidates[0] if candidates else "")
+
+def view_exists(con: duckdb.DuckDBPyConnection, view_name: str) -> bool:
+    try:
+        res = con.execute(f"SELECT name FROM sqlite_master WHERE type='view' AND name='{view_name}'").fetchdf()
+        return not res.empty
+    except Exception:
+        # DuckDB may not support sqlite_master; fallback false
+        return False
+
+# -----------------------
+# Gradio / main
+# -----------------------
 def main():
-    # Paths esperados (coloque seus CSVs em data/)
-    expected = {
-        "Sites": os.path.join(DATA_DIR, "sites.csv"),
-        "Stoppers": os.path.join(DATA_DIR, "stoppers.csv"),
-        "Projeto": os.path.join(DATA_DIR, "projetos.csv"),
-        "Tarefas": os.path.join(DATA_DIR, "tarefas.csv"),
-    }
-    # Validar arquivos
-    missing = [p for p in expected.values() if not os.path.exists(p)]
-    if missing:
-        logger.warning("Arquivos faltando em data/: " + ", ".join(missing))
-        # Não falha aqui para facilitar testes locais; mas avisa o usuário
-    # Carrega só os CSVs existentes
-    present = {k: v for k, v in expected.items() if os.path.exists(v)}
-    if not present:
-        # Para permitir testes locais sem dados, cria bases vazias com colunas mínimas
-        logger.info("Nenhuma base encontrada em data/ — criando bases vazias para UI.")
-        bases = {
-            "Sites": pd.DataFrame(columns=["codigo", "nome", "estado", "observacao"]),
-            "Stoppers": pd.DataFrame(columns=["cod_stopper", "descricao", "criticidade", "risco", "observacao"]),
-            "Projeto": pd.DataFrame(columns=["codigo", "fase", "descricao", "observacao"]),
-            "Tarefas": pd.DataFrame(columns=["codigo", "atividade", "status", "observacao", "executor"]),
-        }
-    else:
-        bases = load_bases({k: expected[k] for k in expected if os.path.exists(expected[k])})
+    # Load stoppers
+    df = load_stoppers(STOPPERS_CSV)
+    # Quick normalize: create consistent internal column names by aliasing in duckdb (we'll register as 'stoppers')
+    con = duckdb.connect(database=':memory:')
+    # Try simple renames to remove spaces and accents for SQL convenience (but keep original df for RAG)
+    safe_df = df.copy()
+    # normalize date column names if they exist (map a few possibilities)
+    col_map = {}
+    for col in safe_df.columns:
+        safe_name = col.replace(" ", "_").replace("-", "_").replace(".", "").replace("/","_")
+        if safe_name != col:
+            safe_df = safe_df.rename(columns={col: safe_name})
+            col_map[safe_name] = col
+    # Register to duckdb
+    con.register("stoppers", safe_df)
+    table_name = "stoppers"
 
-    retriever = HybridRetriever(bases)
+    # Build semantic index: choose text columns to include in embeddings
+    # We'll include Nome Stopper, Tipo de Stopper, Descrição, Criticidade, Responsavel, Fornecedor responsavel, Nombres de sitios
+    candidate_text_cols = [c for c in safe_df.columns if any(k.lower() in c.lower() for k in ["nome", "stopper", "descricao", "descrição", "tipo", "criticidade", "responsavel", "fornecedor", "nombres", "nombres_de"])]
+    if not candidate_text_cols:
+        candidate_text_cols = safe_df.columns.tolist()
+    logger.info(f"Colunas textuais para embeddings: {candidate_text_cols}")
+    sem_index = SemanticIndex(safe_df, candidate_text_cols)
+
+    # LLM provider
     llm = LLMProvider()
-    graph = build_graph(retriever, llm)
 
-# ---------------------------
-# Gradio UI
-# ---------------------------
-def main():
-    # Paths esperados (coloque seus CSVs em data/)
-    expected = {
-        "Sites": os.path.join(DATA_DIR, "sites.csv"),
-        "Stoppers": os.path.join(DATA_DIR, "stoppers.csv"),
-        "Projeto": os.path.join(DATA_DIR, "projetos.csv"),
-        "Tarefas": os.path.join(DATA_DIR, "tarefas.csv"),
-    }
-    # Validar arquivos
-    missing = [p for p in expected.values() if not os.path.exists(p)]
-    if missing:
-        logger.warning("Arquivos faltando em data/: " + ", ".join(missing))
-        # Não falha aqui para facilitar testes locais; mas avisa o usuário
-    # Carrega só os CSVs existentes
-    present = {k: v for k, v in expected.items() if os.path.exists(v)}
-    if not present:
-        # Para permitir testes locais sem dados, cria bases vazias com colunas mínimas
-        logger.info("Nenhuma base encontrada em data/ — criando bases vazias para UI.")
-        bases = {
-            "Sites": pd.DataFrame(columns=["codigo", "nome", "estado", "observacao"]),
-            "Stoppers": pd.DataFrame(columns=["cod_stopper", "descricao", "criticidade", "risco", "observacao"]),
-            "Projeto": pd.DataFrame(columns=["codigo", "fase", "descricao", "observacao"]),
-            "Tarefas": pd.DataFrame(columns=["codigo", "atividade", "status", "observacao", "executor"]),
-        }
-    else:
-        bases = load_bases({k: expected[k] for k in expected if os.path.exists(expected[k])})
+    # Build LangGraph
+    graph = build_graph(sem_index, con, table_name, llm)
 
-    retriever = HybridRetriever(bases)
-    llm = LLMProvider()
-    graph = build_graph(retriever, llm)
+    # Conversation memory (very simple, per-session)
+    sessions: Dict[str, List[Dict[str,str]]] = {}
 
-    # Gradio components
-    base_choices = list(bases.keys())
-    dropdown = gr.Dropdown(base_choices, label="Base", value=base_choices[0] if base_choices else None)
-    query_box = gr.Textbox(lines=2, label="Pergunta (ex.: 'Quais stoppers com criticidade alta aguardam execução?')")
-    where_box = gr.Textbox(lines=1, label="Filtro SQL opcional (ex.: estado='CE' )", placeholder="Deixe vazio para sem filtro")
-    k_slider = gr.Slider(minimum=1, maximum=20, step=1, value=TOP_K, label="Número de trechos recuperados (k)")
+    # Gradio UI
+    with gr.Blocks(title="Agente Stoppers - Brisanet") as demo:
+        gr.Markdown("# Agente Stoppers — Brisanet\nPergunte sobre stoppers. Peça análises avançadas explicitamente (ex.: '% resolvidos dentro do prazo no mês passado').")
+        user_input = gr.Textbox(lines=2, label="Sua pergunta")
+        session_id = gr.Textbox(value="default", label="Session ID (use para manter contexto)", visible=False)
+        chat_output = gr.Textbox(lines=12, label="Resposta")
+        btn = gr.Button("Enviar")
 
-    # Outputs: resposta textual + trechos recuperados (tabela)
-    response_out = gr.Textbox(lines=15, label="Resposta do Agente")
-    retrieved_out = gr.Dataframe(headers=["_snippet", "_score"], label="Trechos Recuperados (snippet + score)")
+        def handle_question(question: str, sess: str):
+            sess = sess or "default"
+            # store history
+            sessions.setdefault(sess, [])
+            # invoke graph
+            state_in = {"pergunta": question}
+            out = graph.invoke(state_in)
+            # out is a Pydantic model dict
+            result = out.get("result") or "Sem resposta gerada."
+            # Append to memory
+            sessions[sess].append({"q": question, "a": result})
+            return result
 
-    def run_agent(base, query, where_sql, k):
-        t0 = time.time()
-        state = AgentState(query=query or "", base=base or "", where_sql=(where_sql or None), k=int(k))
-        out_state = graph.invoke(state)
-        # prepare retrieved table
-        if out_state.get('retrieved'):
-            df = pd.DataFrame(out_state.get('retrieved'))
-            # ensure snippet and score are present
-            if "_snippet" not in df.columns:
-                df["_snippet"] = df.apply(lambda r: " / ".join([str(r[c]) for c in r.index if c not in ["_score"] and str(r[c]).strip() != ""]), axis=1)
-            if "_score" not in df.columns:
-                df["_score"] = ""
-            # reduce columns for display
-            display_df = df[["_snippet", "_score"]].copy()
-        else:
-            display_df = pd.DataFrame([{"_snippet": "Nenhum trecho encontrado", "_score": ""}])
-        elapsed = time.time() - t0
-        logger.info(f"Pergunta='{query}' Base={base} k={k} -> tempo {elapsed:.2f}s")
-        return out_state.get('result') or "Sem resposta", display_df
+        btn.click(fn=handle_question, inputs=[user_input, session_id], outputs=[chat_output])
 
-    with gr.Blocks(title="Agente RAG - Brisanet (Sites/Stoppers/Projeto/Tarefas)") as demo:
-        gr.Markdown("# Agente RAG — Rápido e robusto")
-        with gr.Row():
-            with gr.Column(scale=3):
-                dropdown.render()
-                query_box.render()
-                where_box.render()
-                k_slider.render()
-                btn = gr.Button("Enviar")
-            with gr.Column(scale=2):
-                response_out.render()
-                retrieved_out.render()
-        btn.click(fn=run_agent, inputs=[dropdown, query_box, where_box, k_slider], outputs=[response_out, retrieved_out])
-
-    # Launch
     demo.launch(server_name="0.0.0.0", server_port=PORT, share=False)
 
 if __name__ == "__main__":
