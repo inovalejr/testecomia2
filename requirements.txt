@@ -1,9 +1,10 @@
 numpy
 pandas
 duckdb
-scikit-learn
 sentence-transformers
+scikit-learn
 gradio
-langgraph
 pydantic
+langgraph
+openai
 openai==0.28.1
