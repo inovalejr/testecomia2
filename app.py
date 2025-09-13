@@ -324,27 +324,27 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             return {"result": answer, "retrieved": None}
         # Other grouping requests: "por criticidade", "por tipo", "por responsavel"
         match = re.search(r"por (\w+)", q)
-        if match:
-            col = match.group(1)
-            # try mapping small Portuguese column words to actual column names heuristically
-            mapping = {
-                "criticidade": ["Criticidade","criticidade"],
-                "tipo": ["Tipo de Stopper","Tipo","Tipo_de_Stopper"],
-                "responsavel": ["Responsavel","responsavel","Papel responsable","Fornecedor responsavel"],
-                "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
-            }
-            cand_cols = mapping.get(col, [col])
-            chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
-            res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
-            prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
-            answer = llm.answer(prompt)
-            return {"result": answer, "retrieved": None}
-
-        # Fallback generic: run top N stoppers frequency
-        res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
-        prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
+    if match:
+        col = match.group(1)
+        # try mapping small Portuguese column words to actual column names heuristically
+        mapping = {
+            "criticidade": ["Criticidade","criticidade"],
+            "tipo": ["Tipo de Stopper","Tipo","Tipo_de_Stopper"],
+            "responsavel": ["Responsavel","responsavel","Papel responsable","Fornecedor responsavel"],
+            "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
+        }
+        cand_cols = mapping.get(col, [col])
+        chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
+        res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
+        prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": None}
+
+    # Fallback generic: run top N stoppers frequency
+    res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
+    prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
+    answer = llm.answer(prompt)
+    return {"result": answer, "retrieved": None}
 
     def pedir_info(state: AgentState) -> AgentState:
         # Ask the user to clarify
