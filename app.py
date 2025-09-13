@@ -153,9 +153,9 @@ def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str,
     # We need to ensure column names are safe; map user columns to normalized ones in df_name
     query = f"""
     SELECT
-       SUM(CASE WHEN Data_de_encerramento!='' AND Data_de_vencimiento!='' AND date(Data_de_encerramento) <= date(Data_de_vencimiento) THEN 1 ELSE 0 END) as dentro,
-       SUM(CASE WHEN Data_de_encerramento!='' THEN 1 ELSE 0 END) as encerrados,
-       COUNT(*) as total
+        SUM(CASE WHEN Data_de_encerramento!='' AND Data_de_vencimiento!='' AND date(Data_de_encerramento) <= date(Data_de_vencimiento) THEN 1 ELSE 0 END) as dentro,
+        SUM(CASE WHEN Data_de_encerramento!='' THEN 1 ELSE 0 END) as encerrados,
+        COUNT(*) as total
     FROM {df_name}
     {where}
     """
@@ -180,12 +180,11 @@ def duckdb_group_count_percent(con: duckdb.DuckDBPyConnection, group_col: str, d
     """
     Agrupa por uma coluna e retorna top N com percentuais
     """
-    safe_col = group_col.replace('"', '')
     try:
         q = f"""
-        SELECT {safe_col} as grupo, COUNT(*) as cnt
+        SELECT "{group_col}" as grupo, COUNT(*) as cnt
         FROM {df_name}
-        GROUP BY {safe_col}
+        GROUP BY "{group_col}"
         ORDER BY cnt DESC
         LIMIT {top_n}
         """
@@ -258,12 +257,12 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
         # Simple keyword triage to decide path
         if any(k in q for k in ["abrir chamado","abram chamado","abrir ticket","abrir chamado"]):
             # direct open ticket
-            return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "ABRIR_CHAMADO"}
+            return {"action_suggested": "ABRIR_CHAMADO"}
         # If user asks for statistics/percentual -> advanced analytics
         if detect_advanced_request(q):
-            return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "ANALISE_AVANCADA"}
+            return {"action_suggested": "ANALISE_AVANCADA"}
         # If user asks simple verification or asks about a specific stopper -> try auto-resolver (retrieve context + answer)
-        return {"pergunta": state.pergunta, "result": None, "retrieved": None, "action_suggested": "AUTO_RESOLVER"}
+        return {"action_suggested": "AUTO_RESOLVER"}
 
     def auto_resolver(state: AgentState) -> AgentState:
         q = state.pergunta or ""
@@ -279,7 +278,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
         context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
         prompt = f"Contexto (trechos relevantes):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
         answer = llm.answer(prompt)
-        return {"pergunta": state.pergunta, "result": answer, "retrieved": rows, "action_suggested": None}
+        return {"result": answer, "retrieved": rows}
 
     def analise_avancada(state: AgentState) -> AgentState:
         # Interpret some advanced queries and run DuckDB aggregations
@@ -310,10 +309,10 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             rename_sql = f"""
             CREATE OR REPLACE VIEW stoppers_work AS
             SELECT
-               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de solicitacao','Data_de_solicitacao','Data de solicitacao'])}" AS Data_de_solicitacao,
-               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de vencimiento','Data_de_vencimiento','Data de vencimiento'])}" AS Data_de_vencimiento,
-               "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de encerramento','Data_de_encerramento','Data de encerramento'])}" AS Data_de_encerramento,
-               *
+                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de solicitacao','Data_de_solicitacao','Data de solicitacao'])}" AS Data_de_solicitacao,
+                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de vencimiento','Data_de_vencimiento','Data de vencimiento'])}" AS Data_de_vencimiento,
+                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de encerramento','Data_de_encerramento','Data de encerramento'])}" AS Data_de_encerramento,
+                *
             FROM {df_table_name}
             """
             # If we can't robustly rename, ignore and just try working with original columns (duckdb is tolerant)
@@ -322,7 +321,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             # Use LLM to polish textual output if needed
             prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nFormule uma resposta humana e consultiva com recomendações práticas."
             answer = llm.answer(prompt)
-            return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+            return {"result": answer, "retrieved": None}
         # Other grouping requests: "por criticidade", "por tipo", "por responsavel"
         match = re.search(r"por (\w+)", q)
         if match:
@@ -339,24 +338,24 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
             prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
             answer = llm.answer(prompt)
-            return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+            return {"result": answer, "retrieved": None}
 
         # Fallback generic: run top N stoppers frequency
         res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
         prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
         answer = llm.answer(prompt)
-        return {"pergunta": state.pergunta, "result": answer, "retrieved": None, "action_suggested": None}
+        return {"result": answer, "retrieved": None}
 
     def pedir_info(state: AgentState) -> AgentState:
         # Ask the user to clarify
-        return {"pergunta": state.pergunta, "result": "Preciso de mais detalhes para responder; por favor especifique o período, cidade ou coluna desejada.", "retrieved": None, "action_suggested": None}
+        return {"result": "Preciso de mais detalhes para responder; por favor especifique o período, cidade ou coluna desejada.", "retrieved": None}
 
     def abrir_chamado(state: AgentState) -> AgentState:
         # Provide template for opening ticket
         q = state.pergunta or ""
         template = (f"Solicitação de abertura de chamado gerada automaticamente.\nResumo: {q[:250]}\n"
                     "Prioridade sugerida: Alta. Próximo passo: notificar responsável do workflow.")
-        return {"pergunta": state.pergunta, "result": template, "retrieved": None, "action_suggested": "ABRIR_CHAMADO"}
+        return {"result": template, "retrieved": None}
 
     # Register nodes
     graph.add_node("triagem", triagem)
