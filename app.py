@@ -79,8 +79,6 @@ def load_stoppers(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str).fillna("")
     # Normalize column names (strip)
     df.columns = [c.strip() for c in df.columns]
-    # Standardize known Portuguese column names variants
-    # (no rename forced, we'll access by names as-is, but ensure common ones exist)
     return df
 
 # -----------------------
@@ -130,19 +128,13 @@ class SemanticIndex:
 # Advanced duckdb queries (only run when asked)
 # -----------------------
 def detect_advanced_request(text: str) -> bool:
-    # triggers for advanced analytics: percent, resolved within, taxa, percentual, "mês", last month, "resolvidos dentro"
     patterns = [r"\bpercent", r"\bpercentual", r"\bporcent", r"\bresolvid", r"dentro do prazo", r"taxa", r"mês", r"último", r"última", r"last month", r"\b%"]
     t = text.lower()
     return any(re.search(p, t) for p in patterns)
 
 def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str, period: Optional[dict] = None) -> str:
-    """
-    Exemplo de análise: % de stoppers resolvidos dentro do prazo.
-    period: optional dict like {"year":2024,"month":8} to limit by month of solicitation or vencimento.
-    """
     where = ""
     if period and period.get("year"):
-        # assume Data de solicitacao in YYYY-MM-DD or similar
         y = int(period["year"])
         m = int(period.get("month", 0))
         if m:
@@ -150,7 +142,6 @@ def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str,
         else:
             where = f"WHERE strftime('%Y', Data_de_solicitacao)='{y}'"
 
-    # We need to ensure column names are safe; map user columns to normalized ones in df_name
     query = f"""
     SELECT
         SUM(CASE WHEN Data_de_encerramento!='' AND Data_de_vencimiento!='' AND date(Data_de_encerramento) <= date(Data_de_vencimiento) THEN 1 ELSE 0 END) as dentro,
@@ -159,8 +150,6 @@ def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str,
     FROM {df_name}
     {where}
     """
-    # Try multiple possible column name spellings - we'll adapt query to actual column names in the temp table
-    # But for simplicity below, assume we created a temp view with aliased columns: Data_de_solicitacao, Data_de_vencimiento, Data_de_encerramento
     try:
         res = con.execute(query).fetchdf()
         if res.empty:
@@ -177,9 +166,6 @@ def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str,
         return "Não foi possível calcular o percentual devido a formato de datas ou colunas."
 
 def duckdb_group_count_percent(con: duckdb.DuckDBPyConnection, group_col: str, df_name: str, top_n: int = 6) -> str:
-    """
-    Agrupa por uma coluna e retorna top N com percentuais
-    """
     try:
         q = f"""
         SELECT "{group_col}" as grupo, COUNT(*) as cnt
@@ -249,42 +235,33 @@ class AgentState(BaseModel):
     retrieved: Optional[List[Dict[str,Any]]] = None
     action_suggested: Optional[str] = None
 
-def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_table_name: str, llm: LLMProvider):
+def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_table_name: str, llm: LLMProvider, safe_df: pd.DataFrame):
     graph = StateGraph(AgentState)
 
     def triagem(state: AgentState) -> AgentState:
         q = (state.pergunta or "").lower()
-        # Simple keyword triage to decide path
-        if any(k in q for k in ["abrir chamado","abram chamado","abrir ticket","abrir chamado"]):
-            # direct open ticket
+        if any(k in q for k in ["abrir chamado","abram chamado","abrir ticket"]):
             return {"action_suggested": "ABRIR_CHAMADO"}
-        # If user asks for statistics/percentual -> advanced analytics
         if detect_advanced_request(q):
             return {"action_suggested": "ANALISE_AVANCADA"}
-        # If user asks simple verification or asks about a specific stopper -> try auto-resolver (retrieve context + answer)
         return {"action_suggested": "AUTO_RESOLVER"}
 
     def auto_resolver(state: AgentState) -> AgentState:
         q = state.pergunta or ""
-        # semantic retrieve top K
         hits = retriever.search(q, k=TOP_K)
         rows = []
         for idx, score in hits:
             row = retriever.df.iloc[idx].to_dict()
-            # build snippet that is human readable (no scores shown to user)
             snippet = " | ".join([f"{c}: {row.get(c,'')}" for c in retriever.text_cols if str(row.get(c,'')).strip()!=''])
             rows.append({"snippet": snippet})
-        # build prompt for LLM: include system prompt implicitly via LLMProvider, but give context
         context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
         prompt = f"Contexto (trechos relevantes):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": rows}
 
     def analise_avancada(state: AgentState) -> AgentState:
-        # Interpret some advanced queries and run DuckDB aggregations
         q = (state.pergunta or "").lower()
-
-        # Common advanced intents:
+        
         if "resolvid" in q and "prazo" in q or "dentro do prazo" in q or "%" in q or "percent" in q or "percentual" in q:
             period = None
             if "mês passado" in q or "mes passado" in q or "último mês" in q or "ultimo mes" in q:
@@ -292,21 +269,25 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
                 last = today - pd.DateOffset(months=1)
                 period = {"year": last.year, "month": last.month}
             
-            rename_sql = f"""
-            CREATE OR REPLACE VIEW stoppers_work AS
-            SELECT
-                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de solicitacao','Data_de_solicitacao','Data de solicitacao'])}" AS Data_de_solicitacao,
-                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de vencimiento','Data_de_vencimiento','Data de vencimiento'])}" AS Data_de_vencimiento,
-                "{get_col_safe(retrieve_original_cols(con, df_table_name), ['Data de encerramento','Data_de_encerramento','Data de encerramento'])}" AS Data_de_encerramento,
-                *
-            FROM {df_table_name}
-            """
-            res_text = duckdb_percent_resolved_within(con, "stoppers_work" if view_exists(con, "stoppers_work") else df_table_name, period)
+            try:
+                con.execute(f"""
+                CREATE OR REPLACE VIEW stoppers_work AS
+                SELECT
+                    "{get_col_safe(safe_df.columns, ['Data de solicitacao','Data_de_solicitacao','Data de solicitacao'])}" AS Data_de_solicitacao,
+                    "{get_col_safe(safe_df.columns, ['Data de vencimiento','Data_de_vencimiento','Data de vencimiento'])}" AS Data_de_vencimiento,
+                    "{get_col_safe(safe_df.columns, ['Data de encerramento','Data_de_encerramento','Data de encerramento'])}" AS Data_de_encerramento,
+                    *
+                FROM {df_table_name}
+                """)
+                res_text = duckdb_percent_resolved_within(con, "stoppers_work", period)
+            except Exception as ex:
+                logger.warning(f"Failed to create stoppers_work view, trying with original table. Error: {ex}")
+                res_text = duckdb_percent_resolved_within(con, df_table_name, period)
+            
             prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nFormule uma resposta humana e consultiva com recomendações práticas."
             answer = llm.answer(prompt)
             return {"result": answer, "retrieved": None}
         
-        # Other grouping requests: "por criticidade", "por tipo", "por responsavel"
         match = re.search(r"por (\w+)", q)
         if match:
             col = match.group(1)
@@ -317,24 +298,23 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
                 "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
             }
             cand_cols = mapping.get(col, [col])
-            chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
+            chosen = get_col_safe(safe_df.columns, cand_cols, default=col)
             res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
             prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
             answer = llm.answer(prompt)
             return {"result": answer, "retrieved": None}
 
-        # Fallback generic: run top N stoppers frequency
-        res_text = duckdb_group_count_percent(con, get_col_safe(safe_df.columns, ['Nome Stopper', 'Nome_Stopper'], default='Nome_Stopper'), df_table_name, top_n=6)
+        # Fallback generic
+        chosen_col = get_col_safe(safe_df.columns, ['Nome Stopper', 'Nome_Stopper'], default='Nome_Stopper')
+        res_text = duckdb_group_count_percent(con, chosen_col, df_table_name, top_n=6)
         prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": None}
 
     def pedir_info(state: AgentState) -> AgentState:
-        # Ask the user to clarify
         return {"result": "Preciso de mais detalhes para responder; por favor especifique o período, cidade ou coluna desejada.", "retrieved": None}
 
     def abrir_chamado(state: AgentState) -> AgentState:
-        # Provide template for opening ticket
         q = state.pergunta or ""
         template = (f"Solicitação de abertura de chamado gerada automaticamente.\nResumo: {q[:250]}\n"
                     "Prioridade sugerida: Alta. Próximo passo: notificar responsável do workflow.")
@@ -347,13 +327,28 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
     graph.add_node("pedir_info", pedir_info)
     graph.add_node("abrir_chamado", abrir_chamado)
 
-    # flow: start -> triagem -> branch
+    # Define conditional edges based on action_suggested
+    def route_after_triagem(state: AgentState) -> str:
+        action = state.action_suggested
+        if action == "ABRIR_CHAMADO":
+            return "abrir_chamado"
+        elif action == "ANALISE_AVANCADA":
+            return "analise_avancada"
+        elif action == "AUTO_RESOLVER":
+            return "auto_resolver"
+        else:
+            return "pedir_info"
+
+    # Set up the flow
     graph.set_entry_point("triagem")
-    graph.add_edge("triagem", "auto_resolver")
-    graph.add_edge("triagem", "analise_avancada")
-    graph.add_edge("triagem", "abrir_chamado")
-    graph.add_edge("triagem", "pedir_info")
-    # each node returns END
+    graph.add_conditional_edges("triagem", route_after_triagem, {
+        "abrir_chamado": "abrir_chamado",
+        "analise_avancada": "analise_avancada", 
+        "auto_resolver": "auto_resolver",
+        "pedir_info": "pedir_info"
+    })
+    
+    # All end nodes go to END
     graph.add_edge("auto_resolver", END)
     graph.add_edge("analise_avancada", END)
     graph.add_edge("pedir_info", END)
@@ -362,7 +357,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
     return graph.compile()
 
 # -----------------------
-# Helper functions for duckdb column mapping (used in advanced node)
+# Helper functions for duckdb column mapping
 # -----------------------
 def retrieve_original_cols(con: duckdb.DuckDBPyConnection, table_name: str) -> List[str]:
     try:
@@ -386,7 +381,6 @@ def view_exists(con: duckdb.DuckDBPyConnection, view_name: str) -> bool:
         res = con.execute(f"SELECT name FROM sqlite_master WHERE type='view' AND name='{view_name}'").fetchdf()
         return not res.empty
     except Exception:
-        # DuckDB may not support sqlite_master; fallback false
         return False
 
 # -----------------------
@@ -395,23 +389,22 @@ def view_exists(con: duckdb.DuckDBPyConnection, view_name: str) -> bool:
 def main():
     # Load stoppers
     df = load_stoppers(STOPPERS_CSV)
-    # Quick normalize: create consistent internal column names by aliasing in duckdb (we'll register as 'stoppers')
     con = duckdb.connect(database=':memory:')
-    # Try simple renames to remove spaces and accents for SQL convenience (but keep original df for RAG)
     safe_df = df.copy()
-    # normalize date column names if they exist (map a few possibilities)
+    
+    # Normalize column names
     col_map = {}
     for col in safe_df.columns:
         safe_name = col.replace(" ", "_").replace("-", "_").replace(".", "").replace("/","_")
         if safe_name != col:
             safe_df = safe_df.rename(columns={col: safe_name})
             col_map[safe_name] = col
+    
     # Register to duckdb
     con.register("stoppers", safe_df)
     table_name = "stoppers"
 
-    # Build semantic index: choose text columns to include in embeddings
-    # We'll include Nome Stopper, Tipo de Stopper, Descrição, Criticidade, Responsavel, Fornecedor responsavel, Nombres de sitios
+    # Build semantic index
     candidate_text_cols = [c for c in safe_df.columns if any(k.lower() in c.lower() for k in ["nome", "stopper", "descricao", "descrição", "tipo", "criticidade", "responsavel", "fornecedor", "nombres", "nombres_de"])]
     if not candidate_text_cols:
         candidate_text_cols = safe_df.columns.tolist()
@@ -422,9 +415,9 @@ def main():
     llm = LLMProvider()
 
     # Build LangGraph
-    graph = build_graph(sem_index, con, table_name, llm)
+    graph = build_graph(sem_index, con, table_name, llm, safe_df)
 
-    # Conversation memory (very simple, per-session)
+    # Conversation memory
     sessions: Dict[str, List[Dict[str,str]]] = {}
 
     # Gradio UI
@@ -437,14 +430,10 @@ def main():
 
         def handle_question(question: str, sess: str):
             sess = sess or "default"
-            # store history
             sessions.setdefault(sess, [])
-            # invoke graph
             state_in = {"pergunta": question}
             out = graph.invoke(state_in)
-            # out is a Pydantic model dict
             result = out.get("result") or "Sem resposta gerada."
-            # Append to memory
             sessions[sess].append({"q": question, "a": result})
             return result
 
