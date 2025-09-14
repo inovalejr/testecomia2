@@ -283,29 +283,15 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
     def analise_avancada(state: AgentState) -> AgentState:
         # Interpret some advanced queries and run DuckDB aggregations
         q = (state.pergunta or "").lower()
-        # create a working temporary view with normalized column names for SQL convenience
-        # map expected columns to normalized ones (create a temp table 'stoppers_work')
-        try:
-            # Try to produce normalized columns for SQL queries
-            # We'll alias user columns to safe names
-            df_cols = con.execute(f"DESCRIBE {df_table_name}").fetchdf()
-        except Exception:
-            pass  # ignore if can't describe
+
         # Common advanced intents:
         if "resolvid" in q and "prazo" in q or "dentro do prazo" in q or "%" in q or "percent" in q or "percentual" in q:
-            # run percent resolved within due date in last month if month mentioned, else overall
-            # simple period detection: look for 'mês passado' or 'último mês' or 'ultimo mes' or 'ano'
-            # We'll attempt last month
             period = None
             if "mês passado" in q or "mes passado" in q or "último mês" in q or "ultimo mes" in q:
-                # compute last month from now
                 today = pd.Timestamp.now()
                 last = today - pd.DateOffset(months=1)
                 period = {"year": last.year, "month": last.month}
-            # For duckdb computation, ensure we have aliased columns in a temporary table
-            # Let's create a temp view with predictable names from the original df_table_name
-            # Mapping best-effort:
-            # Try common names variants to rename in the view
+            
             rename_sql = f"""
             CREATE OR REPLACE VIEW stoppers_work AS
             SELECT
@@ -315,36 +301,33 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
                 *
             FROM {df_table_name}
             """
-            # If we can't robustly rename, ignore and just try working with original columns (duckdb is tolerant)
-            # Call percent function
             res_text = duckdb_percent_resolved_within(con, "stoppers_work" if view_exists(con, "stoppers_work") else df_table_name, period)
-            # Use LLM to polish textual output if needed
             prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nFormule uma resposta humana e consultiva com recomendações práticas."
             answer = llm.answer(prompt)
             return {"result": answer, "retrieved": None}
+        
         # Other grouping requests: "por criticidade", "por tipo", "por responsavel"
         match = re.search(r"por (\w+)", q)
-    if match:
-        col = match.group(1)
-        # try mapping small Portuguese column words to actual column names heuristically
-        mapping = {
-            "criticidade": ["Criticidade","criticidade"],
-            "tipo": ["Tipo de Stopper","Tipo","Tipo_de_Stopper"],
-            "responsavel": ["Responsavel","responsavel","Papel responsable","Fornecedor responsavel"],
-            "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
-        }
-        cand_cols = mapping.get(col, [col])
-        chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
-        res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
-        prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
+        if match:
+            col = match.group(1)
+            mapping = {
+                "criticidade": ["Criticidade","criticidade"],
+                "tipo": ["Tipo de Stopper","Tipo","Tipo_de_Stopper"],
+                "responsavel": ["Responsavel","responsavel","Papel responsable","Fornecedor responsavel"],
+                "fornecedor": ["Fornecedor responsavel","fornecedor","Fornecedor"]
+            }
+            cand_cols = mapping.get(col, [col])
+            chosen = get_col_safe(retrieve_original_cols(con, df_table_name), cand_cols, default=col)
+            res_text = duckdb_group_count_percent(con, chosen, df_table_name, top_n=6)
+            prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nResponda de forma humana e sugira ações práticas."
+            answer = llm.answer(prompt)
+            return {"result": answer, "retrieved": None}
+
+        # Fallback generic: run top N stoppers frequency
+        res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
+        prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": None}
-
-    # Fallback generic: run top N stoppers frequency
-    res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
-    prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
-    answer = llm.answer(prompt)
-    return {"result": answer, "retrieved": None}
 
     def pedir_info(state: AgentState) -> AgentState:
         # Ask the user to clarify
