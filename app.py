@@ -324,7 +324,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             return {"result": answer, "retrieved": None}
 
         # Fallback generic: run top N stoppers frequency
-        res_text = duckdb_group_count_percent(con, '"Nome Stopper"' if column_exists(con, df_table_name, "Nome Stopper") else "Nome Stopper", df_table_name, top_n=6)
+        res_text = duckdb_group_count_percent(con, get_col_safe(safe_df.columns, ['Nome Stopper', 'Nome_Stopper'], default='Nome_Stopper'), df_table_name, top_n=6)
         prompt = f"Usuário perguntou: {state.pergunta}\nResultado analítico bruto:\n{res_text}\n\nTransforme em resposta humana e consultiva."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": None}
