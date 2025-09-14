@@ -40,7 +40,7 @@ EMBED_CACHE_DIR = os.getenv("EMBED_CACHE_DIR", "embed_cache")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", 8080))
-TOP_K = int(os.getenv("TOP_K", 6))
+TOP_K = int(os.getenv("TOP_K", 20))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
@@ -116,12 +116,19 @@ class SemanticIndex:
         logger.info(f"Embeddings salvos em cache: {path}")
         return emb
 
-    def search(self, query: str, k:int = TOP_K) -> List[Tuple[int, float]]:
+    def search(self, query: str, k:int = None) -> List[Tuple[int, float]]:
         if not query or str(query).strip()=="":
             return []
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
         sims = cosine_similarity(q_emb, self.emb)[0]
-        topk = sims.argsort()[::-1][:k]
+        
+        # Se k não especificado ou for muito grande, retornar todos os registros ordenados por relevância
+        if k is None or k >= len(sims):
+            topk = sims.argsort()[::-1]
+        else:
+            # Usar argpartition para encontrar os k maiores elementos mais eficientemente
+            topk_indices = np.argpartition(sims, -k)[-k:]
+            topk = topk_indices[np.argsort(sims[topk_indices])[::-1]]
         return [(int(i), float(sims[i])) for i in topk]
 
 # -----------------------
@@ -231,6 +238,7 @@ class LLMProvider:
 # -----------------------
 class AgentState(BaseModel):
     pergunta: str
+    top_k: int = 20
     result: Optional[str] = None
     retrieved: Optional[List[Dict[str,Any]]] = None
     action_suggested: Optional[str] = None
@@ -248,14 +256,27 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
 
     def auto_resolver(state: AgentState) -> AgentState:
         q = state.pergunta or ""
-        hits = retriever.search(q, k=TOP_K)
+        top_k = state.top_k
+        logger.info(f"Buscando registros relevantes para: '{q[:50]}...' (modo: {'limitado' if top_k else 'completo'})")
+        
+        # Buscar todos os registros e filtrar por relevância (score > 0.1)
+        hits = retriever.search(q, k=None)  # Buscar todos
+        relevant_hits = [(idx, score) for idx, score in hits if score > 0.1]
+        
+        # Se o usuário especificou um limite, respeitar
+        if top_k and top_k < len(relevant_hits):
+            relevant_hits = relevant_hits[:top_k]
+            logger.info(f"Limitando a {top_k} registros conforme solicitado")
+        
         rows = []
-        for idx, score in hits:
+        for idx, score in relevant_hits:
             row = retriever.df.iloc[idx].to_dict()
             snippet = " | ".join([f"{c}: {row.get(c,'')}" for c in retriever.text_cols if str(row.get(c,'')).strip()!=''])
             rows.append({"snippet": snippet})
+        
+        logger.info(f"Encontrados {len(rows)} registros relevantes (scores: {[f'{h[1]:.3f}' for h in relevant_hits[:3]]}...)")
         context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
-        prompt = f"Contexto (trechos relevantes):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
+        prompt = f"Contexto (trechos relevantes - {len(rows)} registros):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": rows}
 
@@ -404,12 +425,10 @@ def main():
     con.register("stoppers", safe_df)
     table_name = "stoppers"
 
-    # Build semantic index
-    candidate_text_cols = [c for c in safe_df.columns if any(k.lower() in c.lower() for k in ["nome", "stopper", "descricao", "descrição", "tipo", "criticidade", "responsavel", "fornecedor", "nombres", "nombres_de"])]
-    if not candidate_text_cols:
-        candidate_text_cols = safe_df.columns.tolist()
-    logger.info(f"Colunas textuais para embeddings: {candidate_text_cols}")
-    sem_index = SemanticIndex(safe_df, candidate_text_cols)
+    # Build semantic index - usar TODAS as colunas da base de dados
+    all_columns = safe_df.columns.tolist()
+    logger.info(f"Usando TODAS as {len(all_columns)} colunas para embeddings: {all_columns}")
+    sem_index = SemanticIndex(safe_df, all_columns)
 
     # LLM provider
     llm = LLMProvider()
@@ -424,20 +443,35 @@ def main():
     with gr.Blocks(title="Agente Stoppers - Brisanet") as demo:
         gr.Markdown("# Agente Stoppers — Brisanet\nPergunte sobre stoppers. Peça análises avançadas explicitamente (ex.: '% resolvidos dentro do prazo no mês passado').")
         user_input = gr.Textbox(lines=2, label="Sua pergunta")
+        analysis_mode = gr.Radio(
+            choices=["Análise Completa (todos os registros relevantes)", "Análise Limitada (máximo de registros)"],
+            value="Análise Completa (todos os registros relevantes)",
+            label="Modo de Análise"
+        )
+        top_k_slider = gr.Slider(minimum=5, maximum=500, value=50, step=5, label="Máximo de registros (apenas no modo limitado)", visible=False)
         session_id = gr.Textbox(value="default", label="Session ID (use para manter contexto)", visible=False)
         chat_output = gr.Textbox(lines=12, label="Resposta")
         btn = gr.Button("Enviar")
 
-        def handle_question(question: str, sess: str):
+        def handle_question(question: str, mode: str, top_k: int, sess: str):
             sess = sess or "default"
             sessions.setdefault(sess, [])
-            state_in = {"pergunta": question}
+            
+            # Determinar se deve usar limite baseado no modo
+            use_limit = mode == "Análise Limitada (máximo de registros)"
+            limit_value = top_k if use_limit else None
+            
+            state_in = {"pergunta": question, "top_k": limit_value}
             out = graph.invoke(state_in)
             result = out.get("result") or "Sem resposta gerada."
             sessions[sess].append({"q": question, "a": result})
             return result
 
-        btn.click(fn=handle_question, inputs=[user_input, session_id], outputs=[chat_output])
+        def toggle_slider_visibility(mode: str):
+            return gr.update(visible=mode == "Análise Limitada (máximo de registros)")
+
+        analysis_mode.change(fn=toggle_slider_visibility, inputs=[analysis_mode], outputs=[top_k_slider])
+        btn.click(fn=handle_question, inputs=[user_input, analysis_mode, top_k_slider, session_id], outputs=[chat_output])
 
     demo.launch(server_name="0.0.0.0", server_port=PORT, share=False)
 
