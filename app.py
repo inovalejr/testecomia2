@@ -238,7 +238,7 @@ class LLMProvider:
 # -----------------------
 class AgentState(BaseModel):
     pergunta: str
-    top_k: int = 20
+    top_k: Optional[int] = 20
     result: Optional[str] = None
     retrieved: Optional[List[Dict[str,Any]]] = None
     action_suggested: Optional[str] = None
