@@ -263,7 +263,13 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
         hits = retriever.search(q, k=None)  # Buscar todos
         relevant_hits = [(idx, score) for idx, score in hits if score > 0.1]
         
-        # Se o usuário especificou um limite, respeitar
+        # Limitar para evitar rate limit da OpenAI (máximo 100 registros para o LLM)
+        max_for_llm = 100
+        if len(relevant_hits) > max_for_llm:
+            logger.info(f"Encontrados {len(relevant_hits)} registros relevantes, limitando a {max_for_llm} para o LLM")
+            relevant_hits = relevant_hits[:max_for_llm]
+        
+        # Se o usuário especificou um limite menor, respeitar
         if top_k and top_k < len(relevant_hits):
             relevant_hits = relevant_hits[:top_k]
             logger.info(f"Limitando a {top_k} registros conforme solicitado")
@@ -274,9 +280,16 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             snippet = " | ".join([f"{c}: {row.get(c,'')}" for c in retriever.text_cols if str(row.get(c,'')).strip()!=''])
             rows.append({"snippet": snippet})
         
+        # Contar total de registros relevantes encontrados
+        total_relevant = len([(idx, score) for idx, score in hits if score > 0.1])
+        
         logger.info(f"Encontrados {len(rows)} registros relevantes (scores: {[f'{h[1]:.3f}' for h in relevant_hits[:3]]}...)")
         context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
-        prompt = f"Contexto (trechos relevantes - {len(rows)} registros):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
+        
+        # Adicionar informação sobre total encontrado vs enviado para LLM
+        context_info = f"📊 Total de registros relevantes encontrados: {total_relevant}\n📝 Registros analisados pelo LLM: {len(rows)}\n\n"
+        
+        prompt = f"{context_info}Contexto (trechos relevantes - {len(rows)} registros):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
         answer = llm.answer(prompt)
         return {"result": answer, "retrieved": rows}
 
