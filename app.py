@@ -139,6 +139,62 @@ def detect_advanced_request(text: str) -> bool:
     t = text.lower()
     return any(re.search(p, t) for p in patterns)
 
+def detect_count_request(text: str) -> bool:
+    patterns = [r"\bquantidade", r"\bquantos", r"\bcontar", r"\btotal", r"\bnúmero", r"\bfalam sobre", r"\bmencionam", r"\bchuva", r"\btorre", r"\bbase"]
+    t = text.lower()
+    return any(re.search(p, t) for p in patterns)
+
+def duckdb_count_keywords(con: duckdb.DuckDBPyConnection, df_name: str, keywords: List[str]) -> str:
+    """Conta registros que contêm palavras-chave específicas"""
+    try:
+        # Criar condições WHERE para cada palavra-chave
+        conditions = []
+        for keyword in keywords:
+            conditions.append(f"LOWER(Descrição) LIKE '%{keyword.lower()}%'")
+            conditions.append(f"LOWER(Nome_Stopper) LIKE '%{keyword.lower()}%'")
+            conditions.append(f"LOWER(Descrição) LIKE '%{keyword.lower()}%'")
+        
+        where_clause = " OR ".join(conditions)
+        
+        query = f"""
+        SELECT COUNT(*) as total
+        FROM {df_name}
+        WHERE {where_clause}
+        """
+        
+        result = con.execute(query).fetchdf()
+        total = int(result.at[0, 'total'] or 0)
+        
+        # Buscar alguns exemplos
+        examples_query = f"""
+        SELECT Nome_Stopper, Descrição, Status, Data_de_solicitacao
+        FROM {df_name}
+        WHERE {where_clause}
+        LIMIT 10
+        """
+        
+        examples = con.execute(examples_query).fetchdf()
+        
+        response = f"🔍 **Busca por palavras-chave: {', '.join(keywords)}**\n\n"
+        response += f"📊 **Total encontrado: {total} stoppers**\n\n"
+        
+        if total > 0:
+            response += "**Exemplos encontrados:**\n"
+            for i, (_, row) in enumerate(examples.iterrows(), 1):
+                nome = row.get('Nome_Stopper', 'N/A')
+                desc = row.get('Descrição', 'N/A')[:100] + "..." if len(str(row.get('Descrição', ''))) > 100 else row.get('Descrição', 'N/A')
+                status = row.get('Status', 'N/A')
+                data = row.get('Data_de_solicitacao', 'N/A')
+                response += f"{i}. **{nome}** - {desc} (Status: {status}, Data: {data})\n"
+        else:
+            response += "Nenhum stopper encontrado com essas palavras-chave."
+            
+        return response
+        
+    except Exception as ex:
+        logger.error(f"Erro em duckdb_count_keywords: {ex}")
+        return f"Erro ao buscar por palavras-chave: {ex}"
+
 def duckdb_percent_resolved_within(con: duckdb.DuckDBPyConnection, df_name: str, period: Optional[dict] = None) -> str:
     where = ""
     if period and period.get("year"):
@@ -252,6 +308,8 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             return {"action_suggested": "ABRIR_CHAMADO"}
         if detect_advanced_request(q):
             return {"action_suggested": "ANALISE_AVANCADA"}
+        if detect_count_request(q):
+            return {"action_suggested": "CONTAR_KEYWORDS"}
         return {"action_suggested": "AUTO_RESOLVER"}
 
     def auto_resolver(state: AgentState) -> AgentState:
@@ -259,12 +317,43 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
         top_k = state.top_k
         logger.info(f"Buscando registros relevantes para: '{q[:50]}...' (modo: {'limitado' if top_k else 'completo'})")
         
-        # Buscar todos os registros e filtrar por relevância (score > 0.1)
-        hits = retriever.search(q, k=None)  # Buscar todos
-        relevant_hits = [(idx, score) for idx, score in hits if score > 0.1]
+        # Detectar se é uma busca específica por palavras-chave
+        is_keyword_search = any(word in q.lower() for word in ['quantidade', 'quantos', 'contar', 'total', 'número', 'falam sobre', 'mencionam'])
         
-        # Limitar para evitar rate limit da OpenAI (máximo 100 registros para o LLM)
-        max_for_llm = 100
+        if is_keyword_search:
+            # Para buscas específicas, usar busca por palavras-chave primeiro
+            keyword_hits = []
+            search_terms = []
+            
+            # Extrair termos de busca da pergunta
+            if 'chuva' in q.lower():
+                search_terms.extend(['chuva', 'chuvas', 'chuva intensa', 'fortes chuvas', 'atraso devido', 'atraso na programação'])
+            if 'torre' in q.lower():
+                search_terms.extend(['torre', 'torres', 'montagem de torre'])
+            if 'base' in q.lower():
+                search_terms.extend(['base', 'ferragens da base', 'inicio da base'])
+            
+            # Buscar por cada termo
+            for term in search_terms:
+                term_hits = retriever.search(term, k=None)
+                keyword_hits.extend([(idx, score) for idx, score in term_hits if score > 0.3])  # Score mais alto para palavras-chave
+            
+            # Remover duplicatas e ordenar por score
+            unique_hits = {}
+            for idx, score in keyword_hits:
+                if idx not in unique_hits or score > unique_hits[idx]:
+                    unique_hits[idx] = score
+            
+            relevant_hits = sorted(unique_hits.items(), key=lambda x: x[1], reverse=True)
+            logger.info(f"Busca por palavras-chave encontrou {len(relevant_hits)} registros")
+        else:
+            # Busca semântica normal
+            hits = retriever.search(q, k=None)
+            relevant_hits = [(idx, score) for idx, score in hits if score > 0.1]
+        
+        # Para buscas específicas, usar mais registros
+        max_for_llm = 200 if is_keyword_search else 100
+        
         if len(relevant_hits) > max_for_llm:
             logger.info(f"Encontrados {len(relevant_hits)} registros relevantes, limitando a {max_for_llm} para o LLM")
             relevant_hits = relevant_hits[:max_for_llm]
@@ -281,13 +370,16 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             rows.append({"snippet": snippet})
         
         # Contar total de registros relevantes encontrados
-        total_relevant = len([(idx, score) for idx, score in hits if score > 0.1])
+        total_relevant = len(relevant_hits)
         
         logger.info(f"Encontrados {len(rows)} registros relevantes (scores: {[f'{h[1]:.3f}' for h in relevant_hits[:3]]}...)")
         context = "\n\n".join([r["snippet"] for r in rows]) if rows else ""
         
         # Adicionar informação sobre total encontrado vs enviado para LLM
         context_info = f"📊 Total de registros relevantes encontrados: {total_relevant}\n📝 Registros analisados pelo LLM: {len(rows)}\n\n"
+        
+        if is_keyword_search:
+            context_info += f"🔍 Busca específica por palavras-chave ativada\n\n"
         
         prompt = f"{context_info}Contexto (trechos relevantes - {len(rows)} registros):\n{context}\n\nPergunta: {q}\n\nResponda de forma consultiva, prática e sucinta. Se o contexto for insuficiente, peça mais informação."
         answer = llm.answer(prompt)
@@ -354,12 +446,37 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
                     "Prioridade sugerida: Alta. Próximo passo: notificar responsável do workflow.")
         return {"result": template, "retrieved": None}
 
+    def contar_keywords(state: AgentState) -> AgentState:
+        q = (state.pergunta or "").lower()
+        keywords = []
+        
+        # Extrair palavras-chave da pergunta
+        if 'chuva' in q:
+            keywords.extend(['chuva', 'chuvas', 'chuva intensa', 'fortes chuvas'])
+        if 'torre' in q:
+            keywords.extend(['torre', 'torres', 'montagem de torre'])
+        if 'base' in q:
+            keywords.extend(['base', 'ferragens da base', 'inicio da base'])
+        if 'energia' in q:
+            keywords.extend(['energia', 'energia ativa', 'energia não está ativa'])
+        if 'projeto' in q:
+            keywords.extend(['projeto', 'projeto executivo', 'aprovação projeto'])
+        
+        if not keywords:
+            # Fallback para busca genérica
+            keywords = [q.split()[-1]] if q.split() else ['stopper']
+        
+        logger.info(f"Contando stoppers com palavras-chave: {keywords}")
+        result = duckdb_count_keywords(con, df_table_name, keywords)
+        return {"result": result, "retrieved": None}
+
     # Register nodes
     graph.add_node("triagem", triagem)
     graph.add_node("auto_resolver", auto_resolver)
     graph.add_node("analise_avancada", analise_avancada)
     graph.add_node("pedir_info", pedir_info)
     graph.add_node("abrir_chamado", abrir_chamado)
+    graph.add_node("contar_keywords", contar_keywords)
 
     # Define conditional edges based on action_suggested
     def route_after_triagem(state: AgentState) -> str:
@@ -368,6 +485,8 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
             return "abrir_chamado"
         elif action == "ANALISE_AVANCADA":
             return "analise_avancada"
+        elif action == "CONTAR_KEYWORDS":
+            return "contar_keywords"
         elif action == "AUTO_RESOLVER":
             return "auto_resolver"
         else:
@@ -378,6 +497,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
     graph.add_conditional_edges("triagem", route_after_triagem, {
         "abrir_chamado": "abrir_chamado",
         "analise_avancada": "analise_avancada", 
+        "contar_keywords": "contar_keywords",
         "auto_resolver": "auto_resolver",
         "pedir_info": "pedir_info"
     })
@@ -385,6 +505,7 @@ def build_graph(retriever: SemanticIndex, con: duckdb.DuckDBPyConnection, df_tab
     # All end nodes go to END
     graph.add_edge("auto_resolver", END)
     graph.add_edge("analise_avancada", END)
+    graph.add_edge("contar_keywords", END)
     graph.add_edge("pedir_info", END)
     graph.add_edge("abrir_chamado", END)
 
